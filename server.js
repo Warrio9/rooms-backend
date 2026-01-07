@@ -27,13 +27,19 @@ function getRoom(code) {
   return rooms[code];
 }
 
+function send(ws, obj) {
+  try {
+    ws.send(JSON.stringify(obj));
+  } catch {}
+}
+
 function broadcastRoom(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
 
   const users = [...room.clients].map(c => c.nickname);
 
-  const payload = JSON.stringify({
+  const payload = {
     type: "room_update",
     room: roomCode,
     users,
@@ -41,22 +47,15 @@ function broadcastRoom(roomCode) {
     hostId: room.hostId,
     roundOver: room.roundOver,
     submittedCount: room.answers.size
-  });
+  };
 
-  room.clients.forEach(client => {
-    client.send(payload);
-  });
-}
-
-function send(ws, obj) {
-  ws.send(JSON.stringify(obj));
+  room.clients.forEach(client => send(client, payload));
 }
 
 function maybeAssignNewHost(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
 
-  // If host is gone, pick first remaining
   const hostStillHere = [...room.clients].some(c => c.id === room.hostId);
   if (room.hostId && hostStillHere) return;
 
@@ -84,7 +83,6 @@ wss.on("connection", (ws) => {
 
       const room = getRoom(roomCode);
 
-      // Reject if locked
       if (room.locked) {
         send(ws, { type: "join_rejected", reason: "Game already started. Room is locked." });
         ws.close();
@@ -96,23 +94,24 @@ wss.on("connection", (ws) => {
 
       room.clients.add(ws);
 
-      // First client becomes host
       if (!room.hostId) {
         room.hostId = ws.id;
       }
 
       console.log("JOIN:", roomCode, nickname, "id=", ws.id, "host=", room.hostId);
 
+      // Tell this client its id (so it can know if it's host)
+      send(ws, { type: "you_are", clientId: ws.id });
+
       broadcastRoom(roomCode);
       return;
     }
 
-    // If not joined yet, ignore all other messages
+    // ignore everything until joined
     if (!ws.room || !rooms[ws.room]) return;
-
     const room = rooms[ws.room];
 
-    // ===== START GAME (host only) =====
+    // ===== START GAME (HOST ONLY) =====
     if (data.type === "start_game") {
       if (ws.id !== room.hostId) {
         send(ws, { type: "error", message: "Only the host can start the game." });
@@ -124,6 +123,7 @@ wss.on("connection", (ws) => {
       room.roundOver = false;
 
       console.log("START_GAME:", ws.room, "by", ws.nickname);
+
       broadcastRoom(ws.room);
       return;
     }
@@ -141,7 +141,6 @@ wss.on("connection", (ws) => {
 
       room.answers.set(ws.id, answer);
 
-      // Check if all connected players submitted
       const totalPlayers = room.clients.size;
       const submitted = room.answers.size;
 
@@ -153,9 +152,7 @@ wss.on("connection", (ws) => {
         room.roundOver = true;
         console.log("ROUND_OVER:", ws.room);
 
-        const payload = JSON.stringify({ type: "round_over" });
-        room.clients.forEach(client => client.send(payload));
-
+        room.clients.forEach(client => send(client, { type: "round_over" }));
         broadcastRoom(ws.room);
       }
       return;
