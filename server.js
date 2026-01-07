@@ -14,6 +14,7 @@ wss.on("connection", (ws) => {
     const data = JSON.parse(raw);
 
     if (data.type === "join") {
+      console.log("JOIN:", data.room, data.nickname);
       ws.room = data.room;
       ws.nickname = data.nickname;
 
