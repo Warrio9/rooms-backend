@@ -8,8 +8,10 @@ const wss = new WebSocket.Server({ port: PORT });
  *   clients: Set<WebSocket>,
  *   locked: boolean,
  *   hostId: string | null,
- *   answers: Map<clientId, string>,
- *   roundOver: boolean
+ *   answers: Map<clientId, { nickname: string, answer: string }>,
+ *   roundOver: boolean,
+ *   shuffled: Array<{ nickname: string, answer: string }>,
+ *   revealCount: number
  * }
  */
 const rooms = {};
@@ -22,6 +24,8 @@ function getRoom(code) {
       hostId: null,
       answers: new Map(),
       roundOver: false,
+      shuffled: [],
+      revealCount: 0,
     };
   }
   return rooms[code];
@@ -33,22 +37,45 @@ function send(ws, obj) {
   } catch {}
 }
 
-function broadcastRoom(roomCode) {
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+function roomState(roomCode) {
   const room = rooms[roomCode];
-  if (!room) return;
+  if (!room) return null;
 
   const users = [...room.clients].map(c => c.nickname);
+  const submittedCount = room.answers.size;
 
-  const payload = {
+  // Only send revealed subset
+  const revealedAnswers = room.roundOver
+    ? room.shuffled.slice(0, room.revealCount)
+    : [];
+
+  return {
     type: "room_update",
     room: roomCode,
     users,
     locked: room.locked,
     hostId: room.hostId,
     roundOver: room.roundOver,
-    submittedCount: room.answers.size
+    submittedCount,
+    totalPlayers: room.clients.size,
+    revealedAnswers,
+    revealCount: room.revealCount,
+    totalAnswers: room.roundOver ? room.shuffled.length : 0,
   };
+}
 
+function broadcastRoom(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+
+  const payload = roomState(roomCode);
   room.clients.forEach(client => send(client, payload));
 }
 
@@ -70,16 +97,12 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (raw) => {
     let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(raw); } catch { return; }
 
     // ===== JOIN =====
     if (data.type === "join") {
       const roomCode = String(data.room || "LOBBY").trim().toUpperCase();
-      const nickname = String(data.nickname || "Anonymous").trim();
+      const nickname = String(data.nickname || "Anonymous").trim().slice(0, 18);
 
       const room = getRoom(roomCode);
 
@@ -94,20 +117,16 @@ wss.on("connection", (ws) => {
 
       room.clients.add(ws);
 
-      if (!room.hostId) {
-        room.hostId = ws.id;
-      }
+      if (!room.hostId) room.hostId = ws.id;
 
       console.log("JOIN:", roomCode, nickname, "id=", ws.id, "host=", room.hostId);
 
-      // Tell this client its id (so it can know if it's host)
       send(ws, { type: "you_are", clientId: ws.id });
-
       broadcastRoom(roomCode);
       return;
     }
 
-    // ignore everything until joined
+    // Ignore everything until joined
     if (!ws.room || !rooms[ws.room]) return;
     const room = rooms[ws.room];
 
@@ -121,9 +140,10 @@ wss.on("connection", (ws) => {
       room.locked = true;
       room.answers.clear();
       room.roundOver = false;
+      room.shuffled = [];
+      room.revealCount = 0;
 
       console.log("START_GAME:", ws.room, "by", ws.nickname);
-
       broadcastRoom(ws.room);
       return;
     }
@@ -139,7 +159,9 @@ wss.on("connection", (ws) => {
       const answer = String(data.answer || "").trim();
       if (!answer) return;
 
-      room.answers.set(ws.id, answer);
+      room.answers.set(ws.id, { nickname: ws.nickname, answer });
+
+      send(ws, { type: "submitted_ok" });
 
       const totalPlayers = room.clients.size;
       const submitted = room.answers.size;
@@ -148,11 +170,34 @@ wss.on("connection", (ws) => {
 
       broadcastRoom(ws.room);
 
+      // Round ends when everyone currently connected has submitted
       if (totalPlayers > 0 && submitted >= totalPlayers) {
         room.roundOver = true;
-        console.log("ROUND_OVER:", ws.room);
 
+        room.shuffled = [...room.answers.values()];
+        shuffleInPlace(room.shuffled);
+        room.revealCount = 0;
+
+        console.log("ROUND_OVER:", ws.room, "answers=", room.shuffled.length);
+
+        // Notify & broadcast initial reveal state (none revealed yet)
         room.clients.forEach(client => send(client, { type: "round_over" }));
+        broadcastRoom(ws.room);
+      }
+      return;
+    }
+
+    // ===== NEXT ANSWER (HOST ONLY) =====
+    if (data.type === "next_answer") {
+      if (!room.roundOver) return;
+      if (ws.id !== room.hostId) {
+        send(ws, { type: "error", message: "Only the host can reveal the next answer." });
+        return;
+      }
+
+      if (room.revealCount < room.shuffled.length) {
+        room.revealCount += 1;
+        console.log("REVEAL_NEXT:", ws.room, `${room.revealCount}/${room.shuffled.length}`);
         broadcastRoom(ws.room);
       }
       return;
@@ -164,6 +209,8 @@ wss.on("connection", (ws) => {
 
     const room = rooms[ws.room];
     room.clients.delete(ws);
+
+    // If someone leaves mid-round, remove their answer too
     room.answers.delete(ws.id);
 
     maybeAssignNewHost(ws.room);
@@ -171,6 +218,8 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) {
       delete rooms[ws.room];
     } else {
+      // If round already over, keep reveal order as-is.
+      // If round not over, the required submissions changes.
       broadcastRoom(ws.room);
     }
   });
