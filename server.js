@@ -11,23 +11,16 @@ const wss = new WebSocket.Server({ port: PORT });
  *
  *   phase: "lobby" | "answering" | "reveal" | "voting" | "results",
  *
- *   // answers
  *   answers: Map<clientId, { nickname: string, answer: string }>,
  *   shuffled: Array<{ id: string, ownerId: string, nickname: string, answer: string }>,
- *   revealCount: number, // for reveal phase (anonymous)
+ *   revealCount: number,
  *
- *   // voting
  *   votes: Map<clientId, string>, // clientId -> answerId
  *   tallies: Map<string, number>, // answerId -> voteCount
  *
- *   // scoring
  *   scores: Map<string, number>, // ownerId (clientId or "AI") -> score
- *
- *   // results reveal
- *   resultsRevealCount: number
  * }
  */
-
 const rooms = {};
 
 function getRoom(code) {
@@ -46,9 +39,7 @@ function getRoom(code) {
       votes: new Map(),
       tallies: new Map(),
 
-      scores: new Map(), // persistent across rounds unless reset
-
-      resultsRevealCount: 0,
+      scores: new Map(),
     };
   }
   return rooms[code];
@@ -58,15 +49,15 @@ function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch {}
 }
 
+function genId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
 function shuffleInPlace(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
-}
-
-function genId() {
-  return Math.random().toString(36).slice(2, 10);
 }
 
 function ensureScore(room, ownerId) {
@@ -84,7 +75,7 @@ function computeTallies(room) {
 function applyScoring(room) {
   // rules:
   // - voter: +1 if voted AI, else -1
-  // - owner: +1 for each vote their answer received (including AI if you want)
+  // - owner: +1 for each vote their answer received
   for (const [voterId, answerId] of room.votes.entries()) {
     const picked = room.shuffled.find(a => a.id === answerId);
     if (!picked) continue;
@@ -92,51 +83,53 @@ function applyScoring(room) {
     ensureScore(room, voterId);
     ensureScore(room, picked.ownerId);
 
-    if (picked.ownerId === "AI") room.scores.set(voterId, room.scores.get(voterId) + 1);
-    else room.scores.set(voterId, room.scores.get(voterId) - 1);
+    if (picked.ownerId === "AI") {
+      room.scores.set(voterId, room.scores.get(voterId) + 1);
+    } else {
+      room.scores.set(voterId, room.scores.get(voterId) - 1);
+    }
 
     room.scores.set(picked.ownerId, room.scores.get(picked.ownerId) + 1);
   }
 }
 
 function buildScoresPayload(room) {
-  // return array of { id, name, score }
+  // include all connected players + AI (AI always included)
   const list = [];
 
-  // Players (connected or known)
   for (const c of room.clients) {
     ensureScore(room, c.id);
     list.push({ id: c.id, name: c.nickname, score: room.scores.get(c.id) });
   }
 
-  // AI
   ensureScore(room, "AI");
   list.push({ id: "AI", name: "AI", score: room.scores.get("AI") });
 
-  // sort by score desc
   list.sort((a, b) => b.score - a.score);
   return list;
+}
+
+function getAiAnswer(room) {
+  return room.shuffled.find(a => a.ownerId === "AI") || null;
 }
 
 function buildSharedState(roomCode) {
   const room = rooms[roomCode];
   if (!room) return null;
 
+  // IMPORTANT: users list is ONLY real connected players
   const users = [...room.clients].map(c => c.nickname);
 
-  // reveal phase: anonymous answers revealed one by one
   const revealedAnswers = (room.phase === "reveal")
     ? room.shuffled.slice(0, room.revealCount).map(a => ({ text: a.answer }))
     : [];
 
-  // voting phase: all options available (anonymous)
   const voteOptions = (room.phase === "voting" || room.phase === "results")
     ? room.shuffled.map(a => ({ id: a.id, text: a.answer }))
     : [];
 
-  // results phase: host reveals one-by-one
-  const revealedResults = (room.phase === "results")
-    ? room.shuffled.slice(0, room.resultsRevealCount).map(a => ({
+  const results = (room.phase === "results")
+    ? room.shuffled.map(a => ({
         id: a.id,
         text: a.answer,
         votes: room.tallies.get(a.id) || 0,
@@ -144,6 +137,11 @@ function buildSharedState(roomCode) {
         isAI: a.ownerId === "AI",
       }))
     : [];
+
+  const ai = (room.phase === "results") ? getAiAnswer(room) : null;
+  const aiReveal = (room.phase === "results" && ai)
+    ? { text: ai.answer, votes: room.tallies.get(ai.id) || 0 }
+    : null;
 
   return {
     type: "room_update",
@@ -161,11 +159,12 @@ function buildSharedState(roomCode) {
     totalAnswers: room.shuffled.length,
     revealedAnswers,
 
-    voteOptions,
     totalVotes: room.votes.size,
+    voteOptions,
 
-    resultsRevealCount: room.resultsRevealCount,
-    revealedResults,
+    // Results: all at once
+    results,
+    aiReveal,
 
     scores: buildScoresPayload(room),
   };
@@ -181,7 +180,6 @@ function broadcastRoom(roomCode) {
     const youSubmitted = room.answers.has(client.id);
     const youVoted = room.votes.has(client.id);
     const yourVote = room.votes.get(client.id) || null;
-
     send(client, { ...shared, youSubmitted, youVoted, yourVote });
   });
 }
@@ -204,8 +202,6 @@ function resetRound(room) {
 
   room.votes.clear();
   room.tallies.clear();
-
-  room.resultsRevealCount = 0;
 }
 
 wss.on("connection", (ws) => {
@@ -217,7 +213,7 @@ wss.on("connection", (ws) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // ===== JOIN =====
+    // JOIN
     if (data.type === "join") {
       const roomCode = String(data.room || "LOBBY").trim().toUpperCase();
       const nickname = String(data.nickname || "Anonymous").trim().slice(0, 18);
@@ -232,12 +228,10 @@ wss.on("connection", (ws) => {
 
       ws.room = roomCode;
       ws.nickname = nickname;
-
       room.clients.add(ws);
 
       if (!room.hostId) room.hostId = ws.id;
 
-      // init score
       ensureScore(room, ws.id);
       ensureScore(room, "AI");
 
@@ -251,7 +245,7 @@ wss.on("connection", (ws) => {
     if (!ws.room || !rooms[ws.room]) return;
     const room = rooms[ws.room];
 
-    // ===== START GAME (HOST ONLY) =====
+    // START GAME (host)
     if (data.type === "start_game") {
       if (ws.id !== room.hostId) {
         send(ws, { type: "error", message: "Only the host can start the game." });
@@ -262,12 +256,12 @@ wss.on("connection", (ws) => {
       room.phase = "answering";
       resetRound(room);
 
-      console.log("START_GAME:", ws.room, "by", ws.nickname);
+      console.log("START_GAME:", ws.room);
       broadcastRoom(ws.room);
       return;
     }
 
-    // ===== SUBMIT ANSWER =====
+    // SUBMIT ANSWER
     if (data.type === "submit_answer") {
       if (!room.locked || room.phase !== "answering") {
         send(ws, { type: "error", message: "Game not started yet." });
@@ -291,7 +285,7 @@ wss.on("connection", (ws) => {
       const submitted = room.answers.size;
 
       if (totalPlayers > 0 && submitted >= totalPlayers) {
-        // Build shuffled answers + 1 fake AI answer
+        // build answers + fake AI answer
         room.shuffled = [...room.answers.entries()].map(([ownerId, v]) => ({
           id: genId(),
           ownerId,
@@ -311,14 +305,14 @@ wss.on("connection", (ws) => {
         room.phase = "reveal";
         room.revealCount = 0;
 
-        console.log("ROUND_OVER -> REVEAL:", ws.room, "answers=", room.shuffled.length);
+        console.log("ANSWERING DONE -> REVEAL:", ws.room);
         room.clients.forEach(c => send(c, { type: "round_over" }));
         broadcastRoom(ws.room);
       }
       return;
     }
 
-    // ===== NEXT ANSWER (HOST ONLY) =====
+    // NEXT ANSWER (host)
     if (data.type === "next_answer") {
       if (room.phase !== "reveal") return;
 
@@ -330,12 +324,10 @@ wss.on("connection", (ws) => {
       if (room.revealCount < room.shuffled.length) {
         room.revealCount += 1;
 
-        // When finished revealing -> voting starts
         if (room.revealCount >= room.shuffled.length) {
           room.phase = "voting";
           room.votes.clear();
           room.tallies.clear();
-          room.resultsRevealCount = 0;
           console.log("REVEAL DONE -> VOTING:", ws.room);
         }
 
@@ -344,7 +336,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ===== SUBMIT VOTE =====
+    // SUBMIT VOTE
     if (data.type === "submit_vote") {
       if (room.phase !== "voting") {
         send(ws, { type: "error", message: "Voting is not active." });
@@ -362,7 +354,6 @@ wss.on("connection", (ws) => {
       const picked = room.shuffled.find(a => a.id === answerId);
       if (!picked) return;
 
-      // Optional anti-cheese: cannot vote for your own answer
       if (picked.ownerId === ws.id) {
         send(ws, { type: "error", message: "You cannot vote for your own answer." });
         return;
@@ -373,7 +364,6 @@ wss.on("connection", (ws) => {
 
       broadcastRoom(ws.room);
 
-      // If all players voted -> compute score but DO NOT reveal results automatically
       const totalPlayers = room.clients.size;
       const votes = room.votes.size;
 
@@ -381,39 +371,22 @@ wss.on("connection", (ws) => {
         computeTallies(room);
         applyScoring(room);
 
+        // IMPORTANT: show results immediately (no host next-next-next)
         room.phase = "results";
-        room.resultsRevealCount = 0;
 
-        console.log("VOTING DONE -> RESULTS (host reveals):", ws.room);
+        console.log("VOTING DONE -> RESULTS (instant):", ws.room);
         broadcastRoom(ws.room);
       }
       return;
     }
 
-    // ===== NEXT RESULT (HOST ONLY) =====
-    if (data.type === "next_result") {
-      if (room.phase !== "results") return;
-
-      if (ws.id !== room.hostId) {
-        send(ws, { type: "error", message: "Only the host can reveal the next result." });
-        return;
-      }
-
-      if (room.resultsRevealCount < room.shuffled.length) {
-        room.resultsRevealCount += 1;
-        broadcastRoom(ws.room);
-      }
-      return;
-    }
-
-    // ===== NEW ROUND (HOST ONLY) =====
+    // NEW ROUND (host) - keep locked and keep scores
     if (data.type === "new_round") {
       if (ws.id !== room.hostId) {
         send(ws, { type: "error", message: "Only the host can start a new round." });
         return;
       }
 
-      // Keep room locked (no new players). Keep scores.
       room.phase = "answering";
       resetRound(room);
 
@@ -422,14 +395,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ===== RESET GAME (HOST ONLY) =====
+    // RESET GAME (host) - unlock + reset scores
     if (data.type === "reset_game") {
       if (ws.id !== room.hostId) {
         send(ws, { type: "error", message: "Only the host can reset the game." });
         return;
       }
 
-      // Unlock room, reset scores, go back to lobby (players stay connected)
       room.locked = false;
       room.phase = "lobby";
       resetRound(room);
@@ -450,7 +422,6 @@ wss.on("connection", (ws) => {
     const room = rooms[ws.room];
     room.clients.delete(ws);
 
-    // remove their answer & vote if present
     room.answers.delete(ws.id);
     room.votes.delete(ws.id);
 
@@ -459,7 +430,7 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) {
       delete rooms[ws.room];
     } else {
-      // If voting and someone leaves, we may now be "complete"
+      // If voting and someone leaves, we may now be complete
       if (room.phase === "voting") {
         const totalPlayers = room.clients.size;
         const votes = room.votes.size;
@@ -467,7 +438,6 @@ wss.on("connection", (ws) => {
           computeTallies(room);
           applyScoring(room);
           room.phase = "results";
-          room.resultsRevealCount = 0;
         }
       }
       broadcastRoom(ws.room);
