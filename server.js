@@ -3,24 +3,6 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({ port: PORT });
 
-/**
- * rooms[code] = {
- *   clients: Set<WebSocket>,
- *   locked: boolean,
- *   hostId: string|null,
- *
- *   phase: "lobby" | "answering" | "reveal" | "voting" | "results",
- *
- *   answers: Map<clientId, { nickname: string, answer: string }>,
- *   shuffled: Array<{ id: string, ownerId: string, nickname: string, answer: string }>,
- *   revealCount: number,
- *
- *   votes: Map<clientId, string>, // clientId -> answerId
- *   tallies: Map<string, number>, // answerId -> voteCount
- *
- *   scores: Map<string, number>, // ownerId (clientId or "AI") -> score
- * }
- */
 const rooms = {};
 
 function getRoom(code) {
@@ -30,7 +12,7 @@ function getRoom(code) {
       locked: false,
       hostId: null,
 
-      phase: "lobby",
+      phase: "lobby", // lobby | answering | reveal | voting | results
 
       answers: new Map(),
       shuffled: [],
@@ -39,6 +21,7 @@ function getRoom(code) {
       votes: new Map(),
       tallies: new Map(),
 
+      // scores tracked for players + AI (AI score exists but will NOT be shown)
       scores: new Map(),
     };
   }
@@ -73,9 +56,8 @@ function computeTallies(room) {
 }
 
 function applyScoring(room) {
-  // rules:
-  // - voter: +1 if voted AI, else -1
-  // - owner: +1 for each vote their answer received
+  // voter: +1 if voted AI, else -1
+  // owner: +1 per vote their answer got (including AI)
   for (const [voterId, answerId] of room.votes.entries()) {
     const picked = room.shuffled.find(a => a.id === answerId);
     if (!picked) continue;
@@ -83,28 +65,20 @@ function applyScoring(room) {
     ensureScore(room, voterId);
     ensureScore(room, picked.ownerId);
 
-    if (picked.ownerId === "AI") {
-      room.scores.set(voterId, room.scores.get(voterId) + 1);
-    } else {
-      room.scores.set(voterId, room.scores.get(voterId) - 1);
-    }
+    if (picked.ownerId === "AI") room.scores.set(voterId, room.scores.get(voterId) + 1);
+    else room.scores.set(voterId, room.scores.get(voterId) - 1);
 
     room.scores.set(picked.ownerId, room.scores.get(picked.ownerId) + 1);
   }
 }
 
 function buildScoresPayload(room) {
-  // include all connected players + AI (AI always included)
+  // IMPORTANT: scoreboard shows ONLY human players, NOT AI
   const list = [];
-
   for (const c of room.clients) {
     ensureScore(room, c.id);
     list.push({ id: c.id, name: c.nickname, score: room.scores.get(c.id) });
   }
-
-  ensureScore(room, "AI");
-  list.push({ id: "AI", name: "AI", score: room.scores.get("AI") });
-
   list.sort((a, b) => b.score - a.score);
   return list;
 }
@@ -113,12 +87,18 @@ function getAiAnswer(room) {
   return room.shuffled.find(a => a.ownerId === "AI") || null;
 }
 
+function buildUsersList(room) {
+  // AI is a "player" visually only AFTER game starts (locked), not in lobby
+  const users = [...room.clients].map(c => c.nickname);
+  if (room.locked) users.push("AI");
+  return users;
+}
+
 function buildSharedState(roomCode) {
   const room = rooms[roomCode];
   if (!room) return null;
 
-  // IMPORTANT: users list is ONLY real connected players
-  const users = [...room.clients].map(c => c.nickname);
+  const users = buildUsersList(room);
 
   const revealedAnswers = (room.phase === "reveal")
     ? room.shuffled.slice(0, room.revealCount).map(a => ({ text: a.answer }))
@@ -162,11 +142,10 @@ function buildSharedState(roomCode) {
     totalVotes: room.votes.size,
     voteOptions,
 
-    // Results: all at once
     results,
     aiReveal,
 
-    scores: buildScoresPayload(room),
+    scores: buildScoresPayload(room), // NO AI here
   };
 }
 
@@ -233,7 +212,7 @@ wss.on("connection", (ws) => {
       if (!room.hostId) room.hostId = ws.id;
 
       ensureScore(room, ws.id);
-      ensureScore(room, "AI");
+      ensureScore(room, "AI"); // tracked internally, not shown on scoreboard
 
       send(ws, { type: "you_are", clientId: ws.id });
 
@@ -371,8 +350,7 @@ wss.on("connection", (ws) => {
         computeTallies(room);
         applyScoring(room);
 
-        // IMPORTANT: show results immediately (no host next-next-next)
-        room.phase = "results";
+        room.phase = "results"; // instant results
 
         console.log("VOTING DONE -> RESULTS (instant):", ws.room);
         broadcastRoom(ws.room);
@@ -395,7 +373,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // RESET GAME (host) - unlock + reset scores
+    // RESET GAME (host) - unlock + reset scores (AI score exists but not shown)
     if (data.type === "reset_game") {
       if (ws.id !== room.hostId) {
         send(ws, { type: "error", message: "Only the host can reset the game." });
@@ -430,7 +408,6 @@ wss.on("connection", (ws) => {
     if (room.clients.size === 0) {
       delete rooms[ws.room];
     } else {
-      // If voting and someone leaves, we may now be complete
       if (room.phase === "voting") {
         const totalPlayers = room.clients.size;
         const votes = room.votes.size;
